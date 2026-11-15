@@ -1,6 +1,6 @@
-//! PC vitals: CPU, GPU, memory, network, battery. All sampled with plain Win32 calls, ~1 Hz.
+//! PC vitals: CPU, GPU, memory, network, battery, disk, uptime. Plain Win32 calls, ~1 Hz.
 
-use crate::model::SystemSnapshot;
+use crate::model::{current_tile, SystemSnapshot, Tile};
 use std::collections::HashMap;
 use std::time::Instant;
 use windows_sys::Win32::Foundation::FILETIME;
@@ -8,7 +8,8 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2,
 use windows_sys::Win32::System::Performance::*;
 use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
-use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+use windows_sys::Win32::System::SystemInformation::{GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetSystemTimes};
 
 const HISTORY: usize = 60;
@@ -86,16 +87,79 @@ impl Drop for Gpu {
     }
 }
 
+/// Physical-disk activity, Task Manager style ("Active time" + read/write speed). Opened only
+/// while the disk-activity tile is selected, since PDH costs a few MB.
+struct Disk {
+    query: isize,
+    idle: isize,
+    read: isize,
+    write: isize,
+}
+
+impl Disk {
+    fn new() -> Option<Disk> {
+        unsafe {
+            let mut query = 0isize;
+            if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != 0 {
+                return None;
+            }
+            let add = |path: &str| -> Option<isize> {
+                let p: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+                let mut c = 0isize;
+                (PdhAddEnglishCounterW(query, p.as_ptr(), 0, &mut c) == 0).then_some(c)
+            };
+            let counters = (
+                add("\\PhysicalDisk(_Total)\\% Idle Time"),
+                add("\\PhysicalDisk(_Total)\\Disk Read Bytes/sec"),
+                add("\\PhysicalDisk(_Total)\\Disk Write Bytes/sec"),
+            );
+            let (Some(idle), Some(read), Some(write)) = counters else {
+                PdhCloseQuery(query);
+                return None;
+            };
+            PdhCollectQueryData(query);
+            Some(Disk { query, idle, read, write })
+        }
+    }
+
+    fn value(counter: isize) -> Option<f64> {
+        unsafe {
+            let mut v: PDH_FMT_COUNTERVALUE = std::mem::zeroed();
+            let ok = PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE | 0x8000 /* NOCAP100 */, std::ptr::null_mut(), &mut v) == 0 && v.CStatus == 0;
+            ok.then(|| v.Anonymous.doubleValue)
+        }
+    }
+
+    /// (active fraction, read B/s, write B/s)
+    fn sample(&mut self) -> Option<(f64, f64, f64)> {
+        if unsafe { PdhCollectQueryData(self.query) } != 0 {
+            return None;
+        }
+        let idle = Disk::value(self.idle)?;
+        Some((((100.0 - idle) / 100.0).clamp(0.0, 1.0), Disk::value(self.read).unwrap_or(0.0), Disk::value(self.write).unwrap_or(0.0)))
+    }
+}
+
+impl Drop for Disk {
+    fn drop(&mut self) {
+        unsafe { PdhCloseQuery(self.query) };
+    }
+}
+
 pub struct Sampler {
     prev_cpu: Option<(u64, u64)>,
     prev_net: Option<(u64, u64, Instant)>,
     gpu: Option<Gpu>,
+    disk: Option<Disk>,
+    ticks: u64,
     snap: SystemSnapshot,
 }
 
 impl Sampler {
     pub fn new(gpu: bool) -> Sampler {
-        Sampler { prev_cpu: None, prev_net: None, gpu: if gpu { Gpu::new() } else { None }, snap: SystemSnapshot::default() }
+        let drive = std::env::var("SystemDrive").ok().filter(|d| d.len() == 2).unwrap_or_else(|| "C:".into());
+        let snap = SystemSnapshot { disk_drive: drive, ..Default::default() };
+        Sampler { prev_cpu: None, prev_net: None, gpu: if gpu { Gpu::new() } else { None }, disk: None, ticks: 0, snap }
     }
 
     pub fn sample(&mut self) -> SystemSnapshot {
@@ -103,6 +167,12 @@ impl Sampler {
         self.memory();
         self.network();
         self.battery();
+        if self.ticks % 10 == 0 {
+            self.disk_space();
+        }
+        self.disk_activity();
+        self.snap.uptime_secs = unsafe { GetTickCount64() } / 1000;
+        self.ticks += 1;
         if let Some(gpu) = self.gpu.as_mut() {
             if let Some(v) = gpu.sample() {
                 self.snap.gpu_usage = Some(v);
@@ -187,6 +257,37 @@ impl Sampler {
         self.snap.is_plugged_in = p.ACLineStatus == 1;
         self.snap.is_charging = p.BatteryFlag & 8 != 0;
         self.snap.battery_minutes = if p.BatteryLifeTime == u32::MAX || self.snap.is_plugged_in { None } else { Some(p.BatteryLifeTime / 60) };
+    }
+}
+
+impl Sampler {
+    fn disk_space(&mut self) {
+        let root: Vec<u16> = format!("{}\\", self.snap.disk_drive).encode_utf16().chain(Some(0)).collect();
+        let (mut free, mut total) = (0u64, 0u64);
+        if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), std::ptr::null_mut(), &mut total, &mut free) } != 0 {
+            self.snap.disk_total = total;
+            self.snap.disk_used = total.saturating_sub(free);
+        }
+    }
+
+    fn disk_activity(&mut self) {
+        let wanted = current_tile() == Tile::DiskActivity;
+        if !wanted {
+            if self.disk.take().is_some() {
+                self.snap.disk_active = None;
+                self.snap.disk_active_history.clear();
+            }
+            return;
+        }
+        if self.disk.is_none() {
+            self.disk = Disk::new();
+        }
+        if let Some((active, read, write)) = self.disk.as_mut().and_then(Disk::sample) {
+            self.snap.disk_active = Some(active);
+            self.snap.disk_read = read;
+            self.snap.disk_write = write;
+            push(&mut self.snap.disk_active_history, active);
+        }
     }
 }
 

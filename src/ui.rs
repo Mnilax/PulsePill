@@ -79,6 +79,7 @@ fn pressure_color(p: f64) -> Argb {
 pub enum Hit {
     Collapsed,
     OpenT3,
+    Settings,
     Thread(String),
     Agents, // scrollable list area
 }
@@ -89,6 +90,7 @@ pub struct View<'a> {
     pub now: i64,
     pub hover: Option<Hit>,
     pub scroll: f32,
+    pub tile: Tile,
 }
 
 pub struct Frame {
@@ -229,8 +231,16 @@ pub fn draw_expanded(g: &Gfx, v: &View, shape: Rect) -> Frame {
     let sx = left_right + PAD;
     let sw = shape.right() - PAD - sx;
     g.text("This PC", Rect::new(sx + 4.0, hy, 120.0, 22.0), 13.5, Weight::Bold, PRIMARY, Align::Left);
+    // Settings gear in the top-right corner, with the app's own memory next to it.
+    let gr = Rect::new(sx + sw - 22.0, hcy - 11.0, 22.0, 22.0);
+    let ghov = v.hover == Some(Hit::Settings);
+    if ghov {
+        g.fill_circle(gr.x + 11.0, hcy, 22.0, 0x1AFFFFFF);
+    }
+    gear(g, gr.x + 11.0, hcy, if ghov { PRIMARY } else { SECONDARY }, if ghov { 0xFF212123 } else { BG });
+    hits.push((gr, Hit::Settings));
     let mem = format!("app {} MB", v.system.self_memory / (1024 * 1024));
-    g.text(&mem, Rect::new(sx, hy, sw - 4.0, 22.0), 10.0, Weight::Semibold, TERTIARY, Align::Right);
+    g.text(&mem, Rect::new(sx, hy, sw - 28.0, 22.0), 10.0, Weight::Semibold, TERTIARY, Align::Right);
 
     // Agents list.
     let list = Rect::new(shape.x + PAD, shape.y + HEADER_H, LEFT_W, shape.h - HEADER_H - PAD);
@@ -238,8 +248,19 @@ pub fn draw_expanded(g: &Gfx, v: &View, shape: Rect) -> Frame {
     hits.push((list, Hit::Agents));
 
     // System tiles.
-    draw_system(g, v.system, Rect::new(sx, list.y, sw, list.h));
+    draw_system(g, v.system, v.tile, Rect::new(sx, list.y, sw, list.h));
     Frame { hits, content_h, list_h: list.h }
+}
+
+/// A small cog: a ring with eight teeth.
+fn gear(g: &Gfx, cx: f32, cy: f32, color: Argb, hole: Argb) {
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::FRAC_PI_4;
+        let (s, c) = a.sin_cos();
+        g.line(cx + c * 4.0, cy + s * 4.0, cx + c * 6.6, cy + s * 6.6, 2.6, color);
+    }
+    g.fill_circle(cx, cy, 10.5, color);
+    g.fill_circle(cx, cy, 4.2, hole);
 }
 
 fn row_height(t: &AgentThread) -> f32 {
@@ -372,7 +393,7 @@ fn big_value(g: &Gfx, x: f32, y: f32, value: &str, unit: &str, size: f32, color:
     g.text(unit, Rect::new(x + w + gap,y + (size - us) * 0.62, 90.0, us + 6.0), us, Weight::Semibold, TERTIARY, Align::Left);
 }
 
-fn draw_system(g: &Gfx, s: &SystemSnapshot, r: Rect) {
+fn draw_system(g: &Gfx, s: &SystemSnapshot, tile_kind: Tile, r: Rect) {
     let gap = 8.0;
     let small = ((r.h - 2.0 * gap) * 0.31).round();
     let large = r.h - 2.0 * gap - 2.0 * small;
@@ -408,27 +429,8 @@ fn draw_system(g: &Gfx, s: &SystemSnapshot, r: Rect) {
         None => g.text("n/a", Rect::new(gr.x + 10.0, gr.y + 19.0, 60.0, 22.0), 16.0, Weight::Semibold, TERTIARY, Align::Left),
     }
 
-    // Battery / power.
-    let b = Rect::new(r.x, row2, half, small);
-    tile(g, b, "Battery");
-    match s.battery_level {
-        Some(level) => {
-            let color = if level <= 0.2 && !s.is_plugged_in { FAILED } else if s.is_charging { RUNNING } else { PRIMARY };
-            let note = if s.is_charging {
-                "charging".to_string()
-            } else if s.is_plugged_in {
-                "plugged in".to_string()
-            } else {
-                s.battery_minutes.map(fmt_duration).unwrap_or_default()
-            };
-            big_value(g, b.x + 10.0, b.y + 19.0, &fmt_percent(level), &note, 16.0, color);
-            meter(g, Rect::new(b.x + 10.0, b.bottom() - 11.0, b.w - 20.0, 4.0), level, if color == PRIMARY { RUNNING } else { color });
-        }
-        None => {
-            g.text("AC power", Rect::new(b.x + 10.0, b.y + 19.0, b.w - 20.0, 22.0), 14.0, Weight::Semibold, PRIMARY, Align::Left);
-            g.text("no battery", Rect::new(b.x + 10.0, b.bottom() - 19.0, b.w - 20.0, 14.0), 10.0, Weight::Regular, TERTIARY, Align::Left);
-        }
-    }
+    // Configurable tile: battery, disk space, disk activity or uptime.
+    draw_flex_tile(g, s, tile_kind.resolve(s.battery_level.is_some()), Rect::new(r.x, row2, half, small));
 
     // Network.
     let n = Rect::new(r.x + half + gap, row2, half, small);
@@ -439,4 +441,69 @@ fn draw_system(g: &Gfx, s: &SystemSnapshot, r: Rect) {
     };
     line(n.y + 20.0, "↓", CPU, s.net_down);
     line(n.y + 36.0, "↑", NET_UP, s.net_up);
+}
+
+fn draw_flex_tile(g: &Gfx, s: &SystemSnapshot, kind: Tile, b: Rect) {
+    let note_rect = Rect::new(b.x + 10.0, b.bottom() - 19.0, b.w - 20.0, 14.0);
+    match kind {
+        Tile::Battery | Tile::Auto => {
+            tile(g, b, "Battery");
+            match s.battery_level {
+                Some(level) => {
+                    let color = if level <= 0.2 && !s.is_plugged_in { FAILED } else if s.is_charging { RUNNING } else { PRIMARY };
+                    let note = if s.is_charging {
+                        "charging".to_string()
+                    } else if s.is_plugged_in {
+                        "plugged in".to_string()
+                    } else {
+                        s.battery_minutes.map(fmt_duration).unwrap_or_default()
+                    };
+                    big_value(g, b.x + 10.0, b.y + 19.0, &fmt_percent(level), &note, 16.0, color);
+                    meter(g, Rect::new(b.x + 10.0, b.bottom() - 11.0, b.w - 20.0, 4.0), level, if color == PRIMARY { RUNNING } else { color });
+                }
+                None => {
+                    g.text("AC power", Rect::new(b.x + 10.0, b.y + 19.0, b.w - 20.0, 22.0), 14.0, Weight::Semibold, PRIMARY, Align::Left);
+                    g.text("no battery", note_rect, 10.0, Weight::Regular, TERTIARY, Align::Left);
+                }
+            }
+        }
+        Tile::DiskSpace => {
+            tile(g, b, &format!("Disk {}", s.disk_drive.trim_end_matches(':')));
+            if s.disk_total == 0 {
+                g.text("n/a", Rect::new(b.x + 10.0, b.y + 19.0, 60.0, 22.0), 16.0, Weight::Semibold, TERTIARY, Align::Left);
+                return;
+            }
+            let load = s.disk_used as f64 / s.disk_total as f64;
+            let color = pressure_color((load - 0.15).max(0.0)); // disks are fine fuller than RAM
+            g.fill_circle(b.right() - 13.0, b.y + 12.5, 5.0, color);
+            let (used, total, unit) = if s.disk_total >= 1 << 40 {
+                (format!("{:.1}", s.disk_used as f64 / (1u64 << 40) as f64), format!("{:.1}", s.disk_total as f64 / (1u64 << 40) as f64), "TB")
+            } else {
+                (fmt_gb(s.disk_used, 0), fmt_gb(s.disk_total, 0), "GB")
+            };
+            big_value(g, b.x + 10.0, b.y + 19.0, &used, &format!("/ {total} {unit}"), 16.0, PRIMARY);
+            meter(g, Rect::new(b.x + 10.0, b.bottom() - 11.0, b.w - 20.0, 4.0), load, color);
+        }
+        Tile::DiskActivity => {
+            tile(g, b, "Disk");
+            match s.disk_active {
+                Some(a) => {
+                    let pct = format!("{}% active", (a * 100.0).round() as i64);
+                    g.text(&pct, Rect::new(b.x + 10.0, b.y + 6.0, b.w - 20.0, 13.0), 9.0, Weight::Bold, SECONDARY, Align::Right);
+                    let line = |y: f32, label: &str, color: Argb, v: f64| {
+                        g.text(label, Rect::new(b.x + 10.0, y, 14.0, 16.0), 10.0, Weight::Bold, color, Align::Left);
+                        g.text(&fmt_rate(v), Rect::new(b.x + 24.0, y, b.w - 32.0, 16.0), 11.5, Weight::Semibold, PRIMARY, Align::Left);
+                    };
+                    line(b.y + 20.0, "R", CPU, s.disk_read);
+                    line(b.y + 36.0, "W", NET_UP, s.disk_write);
+                }
+                None => g.text("starting…", Rect::new(b.x + 10.0, b.y + 20.0, b.w - 20.0, 16.0), 11.5, Weight::Semibold, TERTIARY, Align::Left),
+            }
+        }
+        Tile::Uptime => {
+            tile(g, b, "Uptime");
+            big_value(g, b.x + 10.0, b.y + 19.0, &fmt_uptime(s.uptime_secs), "", 16.0, PRIMARY);
+            g.text("since last restart", note_rect, 10.0, Weight::Regular, TERTIARY, Align::Left);
+        }
+    }
 }

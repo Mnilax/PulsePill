@@ -37,6 +37,7 @@ const SNAP_DISTANCE: i32 = 40;
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const SETTINGS_KEY: &str = "Software\\PulsePill";
 const APP_NAME: &str = "PulsePill";
+const ID_TILE: usize = 100;
 
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -191,7 +192,7 @@ impl App {
             return;
         }
         let now = now_ms();
-        let view = ui::View { agents: &self.agents, system: &self.system, now, hover: self.hover.clone(), scroll: self.scroll };
+        let view = ui::View { agents: &self.agents, system: &self.system, now, hover: self.hover.clone(), scroll: self.scroll, tile: current_tile() };
         let shape = self.shape();
         unsafe {
             let mut g = gfx::Gfx::new(self.bits, self.px.0, self.px.1, self.scale);
@@ -407,6 +408,7 @@ impl App {
                 shell_open(&url);
                 self.set_target(0.0);
             }
+            Some(ui::Hit::Settings) => self.menu(),
             Some(ui::Hit::OpenT3) => {
                 open_t3_app();
                 self.set_target(0.0);
@@ -426,6 +428,12 @@ impl App {
             AppendMenuW(m, MF_STRING | if self.anchor.is_none() { MF_GRAYED } else { 0 }, 6, w("Reset position").as_ptr());
             AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
             AppendMenuW(m, MF_STRING, 2, w("Open T3 Code").as_ptr());
+            let tiles = CreatePopupMenu();
+            let cur = current_tile();
+            for (i, t) in Tile::ALL.iter().enumerate() {
+                AppendMenuW(tiles, MF_STRING | flag(*t == cur), ID_TILE + i, w(t.label()).as_ptr());
+            }
+            AppendMenuW(m, MF_POPUP, tiles as usize, w("Bottom-left tile").as_ptr());
             AppendMenuW(m, MF_STRING | flag(auto), 1, w("Start with Windows").as_ptr());
             AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
             let label = format!("PulsePill · {} MB RAM", self.system.self_memory / (1024 * 1024));
@@ -435,8 +443,14 @@ impl App {
             SetForegroundWindow(self.hwnd);
             let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, self.hwnd, std::ptr::null());
             PostMessageW(self.hwnd, WM_NULL, 0, 0);
-            DestroyMenu(m);
-            match cmd {
+            DestroyMenu(m); // also destroys the submenu
+            match cmd as usize {
+                c if (ID_TILE..ID_TILE + Tile::ALL.len()).contains(&c) => {
+                    let t = Tile::ALL[c - ID_TILE];
+                    set_current_tile(t);
+                    set_setting("Tile", Some(t.key()));
+                    self.render();
+                }
                 1 => set_autostart(!auto),
                 2 => open_t3_app(),
                 3 => {
@@ -462,12 +476,12 @@ impl App {
 
 // MARK: - Settings & shell helpers
 
-fn save_anchor(anchor: Option<(i32, i32)>) {
+fn set_setting(name: &str, value: Option<&str>) {
     unsafe {
-        let (k, n) = (w(SETTINGS_KEY), w("Anchor"));
-        match anchor {
-            Some((x, y)) => {
-                let v = w(&format!("{x},{y}"));
+        let (k, n) = (w(SETTINGS_KEY), w(name));
+        match value {
+            Some(v) => {
+                let v = w(v);
                 RegSetKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), n.as_ptr(), REG_SZ, v.as_ptr() as *const _, (v.len() * 2) as u32);
             }
             None => {
@@ -475,6 +489,10 @@ fn save_anchor(anchor: Option<(i32, i32)>) {
             }
         }
     }
+}
+
+fn save_anchor(anchor: Option<(i32, i32)>) {
+    set_setting("Anchor", anchor.map(|(x, y)| format!("{x},{y}")).as_deref());
 }
 
 fn load_anchor() -> Option<(i32, i32)> {
@@ -523,12 +541,31 @@ fn autostart_enabled() -> bool {
     reg_string(HKEY_CURRENT_USER, RUN_KEY, APP_NAME).is_some()
 }
 
+fn autostart_command() -> String {
+    format!("\"{}\"", std::env::current_exe().unwrap_or_default().display())
+}
+
+/// If the exe was moved after "Start with Windows" was turned on, point the entry at the new path.
+fn refresh_autostart() {
+    if let Some(cmd) = reg_string(HKEY_CURRENT_USER, RUN_KEY, APP_NAME) {
+        if !cmd.eq_ignore_ascii_case(&autostart_command()) {
+            set_autostart(true);
+        }
+    }
+}
+
+/// `--uninstall`: remove everything PulsePill wrote to the registry. Delete the exe afterwards.
+fn uninstall() {
+    set_autostart(false);
+    unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, w(SETTINGS_KEY).as_ptr()) };
+    unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, w(SETTINGS_KEY).as_ptr()) };
+}
+
 fn set_autostart(on: bool) {
     unsafe {
         let (k, n) = (w(RUN_KEY), w(APP_NAME));
         if on {
-            let exe = std::env::current_exe().unwrap_or_default();
-            let v = w(&format!("\"{}\"", exe.display()));
+            let v = w(&autostart_command());
             RegSetKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), n.as_ptr(), REG_SZ, v.as_ptr() as *const _, (v.len() * 2) as u32);
         } else {
             RegDeleteKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), n.as_ptr());
@@ -567,6 +604,11 @@ unsafe fn make_icon() -> HICON {
 }
 
 fn tray(hwnd: HWND, icon: HICON, op: NOTIFY_ICON_MESSAGE) {
+    tray_with_info(hwnd, icon, op, None);
+}
+
+/// `info`: (title, text) shown as a Windows notification next to the tray icon.
+fn tray_with_info(hwnd: HWND, icon: HICON, op: NOTIFY_ICON_MESSAGE, info: Option<(&str, &str)>) {
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -575,8 +617,16 @@ fn tray(hwnd: HWND, icon: HICON, op: NOTIFY_ICON_MESSAGE) {
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_APP_TRAY;
         nid.hIcon = icon;
-        let tip: Vec<u16> = "PulsePill — click to show/hide".encode_utf16().collect();
+        let tip: Vec<u16> = "PulsePill — click to hide/show, right-click for menu".encode_utf16().collect();
         nid.szTip[..tip.len()].copy_from_slice(&tip);
+        if let Some((title, text)) = info {
+            nid.uFlags |= NIF_INFO;
+            nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+            nid.hBalloonIcon = icon;
+            let (t, x): (Vec<u16>, Vec<u16>) = (title.encode_utf16().collect(), text.encode_utf16().collect());
+            nid.szInfoTitle[..t.len().min(63)].copy_from_slice(&t[..t.len().min(63)]);
+            nid.szInfo[..x.len().min(255)].copy_from_slice(&x[..x.len().min(255)]);
+        }
         Shell_NotifyIconW(op, &nid);
     }
 }
@@ -742,7 +792,7 @@ fn dump() {
     std::thread::sleep(Duration::from_millis(1000));
     let s = s.sample();
     println!(
-        "cpu={} gpu={:?} mem={}/{} GB bat={:?} plugged={} down={} up={}",
+        "cpu={} gpu={:?} mem={}/{} GB bat={:?} plugged={} down={} up={} disk {}={}/{} GB uptime={}",
         fmt_percent(s.cpu_usage),
         s.gpu_usage.map(fmt_percent),
         fmt_gb(s.memory_used, 1),
@@ -750,20 +800,24 @@ fn dump() {
         s.battery_level.map(fmt_percent),
         s.is_plugged_in,
         fmt_rate(s.net_down),
-        fmt_rate(s.net_up)
+        fmt_rate(s.net_up),
+        s.disk_drive,
+        fmt_gb(s.disk_used, 0),
+        fmt_gb(s.disk_total, 0),
+        fmt_uptime(s.uptime_secs)
     );
 }
 
 /// `--render-png=<file>`: draws the expanded pill with sample data into a transparent PNG
 /// (README screenshots without capturing whatever else is on screen).
-fn render_png(path: &str) {
+fn render_png(path: &str, tile: Tile) {
     let scale = 2.0;
     let (w, h) = ((ui::PANEL_W * scale).ceil() as i32, (ui::PANEL_H * scale).ceil() as i32);
     let mut buf = vec![0u8; (w * h * 4) as usize];
     let agents = mock::agents("busy");
     let mut system = mock::system(7, "busy");
     system.self_memory = 11 * 1024 * 1024;
-    let view = ui::View { agents: &agents, system: &system, now: now_ms(), hover: None, scroll: 0.0 };
+    let view = ui::View { agents: &agents, system: &system, now: now_ms(), hover: None, scroll: 0.0, tile };
     gfx::startup();
     unsafe {
         let g = gfx::Gfx::new(buf.as_mut_ptr(), w, h, scale);
@@ -783,8 +837,13 @@ fn main() {
         dump();
         return;
     }
+    if args.iter().any(|a| a == "--uninstall") {
+        uninstall();
+        return;
+    }
+    let tile_arg = args.iter().find_map(|a| a.strip_prefix("--tile=")).and_then(Tile::from_key);
     if let Some(path) = args.iter().find_map(|a| a.strip_prefix("--render-png=")) {
-        render_png(path);
+        render_png(path, tile_arg.unwrap_or_default());
         return;
     }
     let mut opts = Options { mock: None, expanded: false, gpu: true };
@@ -841,6 +900,23 @@ fn main() {
         );
         let tray_icon = make_icon();
         tray(hwnd, tray_icon, NIM_ADD);
+        if let Some(t) = tile_arg.or_else(|| reg_string(HKEY_CURRENT_USER, SETTINGS_KEY, "Tile").and_then(|v| Tile::from_key(&v))) {
+            set_current_tile(t);
+        }
+        refresh_autostart();
+        // First launch: say where the app lives and how to get rid of it.
+        if reg_string(HKEY_CURRENT_USER, SETTINGS_KEY, "Welcomed").is_none() {
+            set_setting("Welcomed", Some("1"));
+            tray_with_info(
+                hwnd,
+                tray_icon,
+                NIM_MODIFY,
+                Some((
+                    "PulsePill is running",
+                    "Hide it: click the tray icon or press Ctrl+Alt+N. Right-click the pill or the icon for settings, Start with Windows and Quit.",
+                )),
+            );
+        }
         // Global show/hide shortcut; silently skipped if another app owns it.
         RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'N' as u32);
 

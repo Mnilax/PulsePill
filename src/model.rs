@@ -54,6 +54,77 @@ pub struct SystemSnapshot {
     pub net_down: f64,
     pub net_up: f64,
     pub self_memory: u64,
+    /// System drive ("C:") space, refreshed every few seconds.
+    pub disk_drive: String,
+    pub disk_used: u64,
+    pub disk_total: u64,
+    /// Disk activity, only sampled while the disk-activity tile is shown.
+    pub disk_active: Option<f64>,
+    pub disk_active_history: Vec<f64>,
+    pub disk_read: f64,
+    pub disk_write: f64,
+    pub uptime_secs: u64,
+}
+
+/// What the bottom-left system tile shows. Battery makes little sense on a desktop PC.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Tile {
+    /// Battery if the PC has one, otherwise disk space.
+    #[default]
+    Auto,
+    Battery,
+    DiskSpace,
+    DiskActivity,
+    Uptime,
+}
+
+impl Tile {
+    pub const ALL: [Tile; 5] = [Tile::Auto, Tile::Battery, Tile::DiskSpace, Tile::DiskActivity, Tile::Uptime];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Tile::Auto => "auto",
+            Tile::Battery => "battery",
+            Tile::DiskSpace => "disk",
+            Tile::DiskActivity => "diskio",
+            Tile::Uptime => "uptime",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Tile> {
+        Tile::ALL.into_iter().find(|t| t.key() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tile::Auto => "Auto (battery on laptops, disk on PCs)",
+            Tile::Battery => "Battery",
+            Tile::DiskSpace => "Disk space",
+            Tile::DiskActivity => "Disk activity",
+            Tile::Uptime => "Uptime",
+        }
+    }
+
+    /// The concrete tile to draw for this machine.
+    pub fn resolve(self, has_battery: bool) -> Tile {
+        match self {
+            Tile::Auto if has_battery => Tile::Battery,
+            Tile::Auto => Tile::DiskSpace,
+            t => t,
+        }
+    }
+}
+
+/// Shared between the UI thread (menu) and the sampler thread (lazily opens the disk counters).
+pub static TILE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn current_tile() -> Tile {
+    Tile::ALL.get(TILE.load(std::sync::atomic::Ordering::Relaxed) as usize).copied().unwrap_or_default()
+}
+
+pub fn set_current_tile(t: Tile) {
+    let i = Tile::ALL.iter().position(|&x| x == t).unwrap_or(0) as u8;
+    TILE.store(i, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn now_ms() -> i64 {
@@ -130,6 +201,16 @@ pub fn fmt_duration(minutes: u32) -> String {
         (0, m) => format!("{m}m"),
         (h, 0) => format!("{h}h"),
         (h, m) => format!("{h}h {m}m"),
+    }
+}
+
+/// "3d 4h", "5h 12m", "42m".
+pub fn fmt_uptime(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60);
+    match (d, h) {
+        (0, 0) => format!("{m}m"),
+        (0, h) => format!("{h}h {m}m"),
+        (d, h) => format!("{d}d {h}h"),
     }
 }
 
@@ -320,5 +401,19 @@ mod tests {
         assert!(preview("abcdefghij klmnop", 10).unwrap().ends_with('…'));
         assert_eq!(preview("привет, мир", 140).unwrap(), "привет, мир");
         assert_eq!(preview("# Заголовок\n1. пункт", 140).unwrap(), "Заголовок пункт");
+    }
+
+    #[test]
+    fn tiles() {
+        for t in Tile::ALL {
+            assert_eq!(Tile::from_key(t.key()), Some(t));
+        }
+        assert_eq!(Tile::from_key("nope"), None);
+        assert_eq!(Tile::Auto.resolve(true), Tile::Battery);
+        assert_eq!(Tile::Auto.resolve(false), Tile::DiskSpace);
+        assert_eq!(Tile::Uptime.resolve(true), Tile::Uptime);
+        assert_eq!(fmt_uptime(42 * 60), "42m");
+        assert_eq!(fmt_uptime(5 * 3600 + 12 * 60), "5h 12m");
+        assert_eq!(fmt_uptime(3 * 86_400 + 4 * 3600 + 59), "3d 4h");
     }
 }

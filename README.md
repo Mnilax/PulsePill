@@ -16,7 +16,8 @@ written in Rust. The T3 Code status logic and its SQL queries are ported from No
   approval or question, a preview of the last message, the model, and live subagents. Click a
   thread to open it in T3 Code (`t3code://threads/<env>/<thread>`).
 - **This PC column**: CPU with a sparkline, GPU load (same counter as Task Manager), memory,
-  battery or AC power, and network throughput.
+  network throughput, and one tile you choose: battery, disk space, disk activity or uptime.
+  By default it shows the battery on laptops and disk space on desktop PCs.
 - **Collapsed pill**: waiting/running counters on the left, CPU sparkline and % on the right.
   Low battery takes over the right side.
 - **Drag it anywhere**, on any monitor. The position is remembered. In the lower half of a screen
@@ -25,8 +26,9 @@ written in Rust. The T3 Code status logic and its SQL queries are ported from No
 - **Hide / show**: left-click the tray icon, press **Ctrl+Alt+N**, middle-click the pill, or use
   the menu.
 - Steps aside while a full-screen app (game, video, presentation) is in front.
-- Right-click menu (pill or tray icon): *Hide island*, *Keep expanded*, *Reset position*,
-  *Open T3 Code*, *Start with Windows*, *Quit*.
+- **Settings menu**: the gear in the top-right corner of the expanded island (right-clicking the
+  pill or the tray icon also works): *Hide island*, *Keep expanded*, *Reset position*,
+  *Open T3 Code*, *Bottom-left tile*, *Start with Windows*, *Quit*.
 - **Read-only, no network, no telemetry.** The T3 database is opened read-only.
 
 ## Footprint
@@ -58,6 +60,20 @@ cargo build --release
 ./target/release/pulsepill.exe --dump        # print what the pill would show, then exit
 ```
 
+## Starting, hiding and quitting
+
+PulsePill is a single `.exe` with no installer. Put it anywhere and run it.
+
+- **It doesn't start with Windows by default.** Turn on *Start with Windows* in the settings
+  menu. If you move the `.exe` later, the entry follows it on the next launch.
+- On first launch a notification explains the controls. The tray icon may land in the hidden
+  icons area (`^`) at first. Drag it onto the taskbar to keep it visible.
+- **Hide it**: left-click the tray icon, press **Ctrl+Alt+N**, or middle-click the pill. It keeps
+  running in the tray. The same actions bring it back.
+- **Quit**: open the menu (gear, or right-click the pill or tray icon) and choose *Quit*.
+- **Uninstall**: run `pulsepill.exe --uninstall` to remove the autostart entry and settings
+  (`HKCU\Software\PulsePill`), then delete the `.exe`.
+
 ## Flags
 
 | Flag                                    | Description                                         |
@@ -67,6 +83,8 @@ cargo build --release
 | `--expanded`                            | Keep the island expanded.                           |
 | `--no-gpu`                              | Skip the GPU counter (saves ~6 MB).                 |
 | `--hidden`                              | Start hidden (tray icon / Ctrl+Alt+N to show).      |
+| `--tile=auto\|battery\|disk\|diskio\|uptime` | Pick the bottom-left tile for this run.      |
+| `--uninstall`                           | Remove autostart and settings from the registry.    |
 | `--dump`                                | Print T3 threads, query timing and PC vitals, exit. |
 | `--render-png=<file>`                   | Draw the expanded pill with sample data to a PNG.   |
 
@@ -82,8 +100,11 @@ cargo build --release
 | Memory           | `GlobalMemoryStatusEx`                                                  |
 | Network          | `GetIfTable2`, physical non-filter interfaces only                      |
 | Battery          | `GetSystemPowerStatus`                                                  |
+| Disk space       | `GetDiskFreeSpaceExW` on the system drive, every 10 s                   |
+| Disk activity    | PDH `\PhysicalDisk(_Total)\` idle time and read/write bytes, opened only while that tile is selected (~0.7 MB) |
+| Uptime           | `GetTickCount64`                                                        |
 | Window           | layered `WS_EX_TOPMOST \| WS_EX_NOACTIVATE` popup drawn with `UpdateLayeredWindow` and per-pixel alpha, so transparent areas pass clicks through |
-| Settings         | `HKCU\Software\PulsePill` (position), `HKCU\...\Run` (start with Windows) |
+| Settings         | `HKCU\Software\PulsePill` (position, tile), `HKCU\...\Run` (start with Windows) |
 
 `$T3CODE_HOME` overrides the T3 base directory, as in NotchPulse.
 

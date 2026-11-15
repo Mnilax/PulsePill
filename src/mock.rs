@@ -61,5 +61,13 @@ pub fn system(tick: u64, scenario: &str) -> SystemSnapshot {
         net_down: 1_450_000.0,
         net_up: 96_000.0,
         self_memory: 0,
+        disk_drive: "C:".into(),
+        disk_used: 412_000_000_000,
+        disk_total: 999_000_000_000,
+        disk_active: Some(wave(tick, 0.23) * 0.5),
+        disk_active_history: Vec::new(),
+        disk_read: 18_400_000.0,
+        disk_write: 2_300_000.0,
+        uptime_secs: 3 * 86_400 + 4 * 3600 + 17 * 60,
     }
 }
