@@ -9,7 +9,7 @@ use windows_sys::Win32::System::Performance::*;
 use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-use windows_sys::Win32::System::SystemInformation::{GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows_sys::Win32::System::SystemInformation::{GetPhysicallyInstalledSystemMemory, GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetSystemTimes};
 
 const HISTORY: usize = 60;
@@ -211,7 +211,11 @@ impl Sampler {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
-            self.snap.memory_total = m.ullTotalPhys;
+            // Show installed RAM ("32 GB"), like Task Manager; ullTotalPhys excludes memory
+            // reserved by firmware and integrated graphics ("31 GB").
+            let mut installed_kb = 0u64;
+            let installed = unsafe { GetPhysicallyInstalledSystemMemory(&mut installed_kb) } != 0;
+            self.snap.memory_total = if installed && installed_kb * 1024 >= m.ullTotalPhys { installed_kb * 1024 } else { m.ullTotalPhys };
             self.snap.memory_used = m.ullTotalPhys - m.ullAvailPhys;
             self.snap.memory_load = m.dwMemoryLoad as f64 / 100.0;
         }
