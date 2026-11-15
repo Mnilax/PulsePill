@@ -1,0 +1,37 @@
+[package]
+name = "pulsepill"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny always-on-top pill for Windows with T3 Code threads and PC vitals (port of NotchPulse)"
+license = "MIT"
+repository = "https://github.com/Mnilax/PulsePill"
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_GdiPlus",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_System_SystemInformation",
+  "Win32_System_Power",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_Performance",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Shell",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
